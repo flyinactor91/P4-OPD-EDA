@@ -1,0 +1,485 @@
+---
+title: "EDA of Orlando Police Reports 2009-2015"
+author: "Michael duPont"
+date: "August 28, 2015"
+output: html_document
+---
+
+#Abstract
+
+In terms of police reporting, Orlando is a large metropolis that likes to pretend it's still a small town. What I mean by this is that the Orlando Police Department files and stores police reports on everything that officers are called on for (except minor traffic stops). This means that Orlando often ranks disproportionately high in crime lists that are based on the number of reports per capita. It also means that we have plenty of data to look through.
+
+#Preparation
+
+Rather than choosing a default set, I asked if anyone in Orlando had a public dataset that they wanted analyzed. Someone in our Code for Orlando brigade sent me a CSV of around 1.5 million Orlando Police Dept. reports.
+
+Before importing the dataset into R, I wanted to split the datetime column into its elements and add the header line to it. I ended up using this Python code in a terminal.
+
+```python
+lines = []
+newlines = []
+with open('opddata.csv' , 'r') as fin: lines = fin.readlines()
+#Split datetime into columns
+for line in lines:
+  line = line.split(',')
+  newline = line[0].strip('"')
+  for item in ['-',' ',':']: newline = newline.replace(item , ',')
+  newline = line[0] + ',' + newline + ',' + ','.join(line[1:])
+  newlines.append(newline)
+#Add header line
+header = 'datetime,year,month,day,hour,minute,second,lat,lon,reason,agency\n'
+with open('opddatasplit.csv' , 'w') as fout:
+  fout.write(header + ''.join(newlines))
+```
+
+Now we can setup our workspace and load it into R.
+
+```{r import and summary , echo=FALSE}
+setwd('~/Documents/Udacity/DataSci/Work/P4-EDA')
+opd <- read.csv('opddatasplit.csv')
+summary(opd)
+head(opd , 1)
+tail(opd , 1)
+```
+
+Yes, this dataset has 1.45 million rows of police reports dating from 2009-05-09 to 2015-08-21. Looking at the datetime items, we can make some initial observations and conjectures.
+
+* It seems like incidents are fairly distributed throughout the year.
+* Our hour column shows that most crime happens in the afternoon, and the difference in the mean/median is due to crimes just after midnight.
+* We can see that there are some outliers in the coordinates that will need to be excluded from any coord-based graphics. I highly doubt OPD has jurisdiction in Europe.
+* Of the 153 reasons in the data, the top six make up 39.5% of all reports. As I mentioned, Orlando also has a reputation of filing reports for everything, not just criminal reports like most large cities. This is why the top three reasons are disturbances, accidents, and suspicious people reports.
+* Lastly, while most of the reports come from the Orlando Police Department, some of them come from the Orange County Sheriff's' Office.
+
+#Analysis
+
+##Datetime
+
+Let's start by looking at the times when the incidents are reported. We'll look at year, month, day, and hour; there's nothing valuable we can gain from minute and second.
+
+```{r hist year , echo=FALSE , fig.width=8 , fig.height=6 , fig.align='center'}
+library(ggplot2)
+ggplot(data = opd , aes(x = factor(year))) +
+  geom_bar(binwidth = 1 , fill = 'blue' , color = 'black') +
+  ggtitle('Reports by Year')
+```
+
+Most years, the bin count is pretty stable just over 200K. We have incomplete data for 2009 and 2015. However, there's a sizable spike in reports in 2014. That's something to investigate later.
+
+```{r hist month , echo=FALSE , fig.width=8 , fig.height=6 , fig.align='center'}
+ggplot(data = opd , aes(x = factor(month))) +
+  geom_bar(binwidth = 1 , fill = 'blue' , color = 'black') +
+  ggtitle('Reports by Month')
+```
+
+We can see there is, in fact, an increase in reports during the Summer months and drops back down to normal in September. This is likely due to having no data before April 2009 and after August 2015. Even still, there's a noticeable drop during December matched only by February, which is usually three days shorter, and we only have four years of data for each. I'd like to see that separated out by year.
+
+```{r hist month facet year , echo=FALSE , fig.width=8 , fig.height=5 , fig.align='center'}
+ggplot(data = opd , aes(x = factor(month))) +
+  geom_bar(binwidth = 1 , fill = 'blue' , color = 'black') +
+  facet_wrap(~year , ncol = 3)
+```
+
+It seems we've found why there was an up-tick in the summer and in 2014: there were about twice as many reports as normal in 2014 from April to November. There's also a spike in August 2015, a month in which we only have 2/3 of the supposed data. Was crime rampant during these months. What I think is more likely is there is a new 'reason' that caused the spike or a police policy that led to having more non-violent reports filed.
+
+```{r boxplot day , warning=FALSE , message=FALSE , echo=FALSE , fig.width=8 , fig.height=6 , fig.align='center'}
+library(dplyr)
+opd.day_num <- opd %>%
+  group_by(day , month , year) %>%
+  summarize(n = n())
+ggplot(data = opd.day_num , aes(x = factor(day) , y = n)) + geom_boxplot() +
+  ggtitle('Number of Reports per Day of the Month')
+rm(opd.day_num)
+```
+
+Turns out the number of daily reports is fairly steady with the median staying around 625 and the range of the middle 50% of values staying around 125. The outliers also seem to form somewhat distinct bands. I want to look at this again later.
+
+```{r hist hour , echo=FALSE , fig.width=8 , fig.height=6 , fig.align='center'}
+ggplot(data = opd , aes(x = factor(hour))) +
+  geom_bar(binwidth = 1 , fill = 'blue' , color = 'black') +
+  ggtitle('Reports by Hour')
+```
+
+Here's a clear view of the hourly reports. We can see that the graph mostly follows a parabolic arc starting at 5 AM and peaking in the early evening. The spike at 6 PM is likely due to rush hour accidents getting reported. I'm interested why there's a drop just before it, though.
+
+##Categorizing Reason
+
+Now I want to look more at the 'reason' column. We have 153 of them, and I'd like to classify them into a couple larger categories.
+
+```{r reason levels , echo=FALSE}
+levels(opd$reason)
+```
+
+Given these levels, I think the best categories will be:
+
+* violent: violent crimes/reports such as murder, kidnapping, and battery
+* nonviolent: non-violent crimes/reports such as criminal mischief, drug violations, and breaking & entering
+* transport: reports involving vehicles, roads, and waterways (that are not considered violent crimes like DUI) including accidents and reckless boating
+* oncall: reports where police responded to a non-criminal call like a 911 hang up, dead animal, or suspicious person
+* other: anything else that doesn't fall into these categories like school zone crossings, bike patrols, and escorts
+
+The items put into each category in the code below are at my discretion. However, I used the definition of violent crime from the Bureau of Justice Statistics as my guide for the first two lists.
+
+> Violent crime involves intentional or intended physical harm to another human including murder, rape and sexual assault, robbery, and assault.
+
+Many police departments also include attempted violent crime as violent crime as well as crimes like arson where bodily harm is possible. This is why robbery (victims present) is a violent crime while burglary (victims not present) is not. I'll also state that, for the purpose of these lists, 'crime' is breaking federal or state laws, not county ordinances, so reasons that include 'violation', which *mostly* apply to local ordinances, will be put in the 'oncall' list.
+
+```{r reason_cat lists}
+violent_list = c('aggravated assault','aggravated battery','armed robbery','arson fire','attempted rape','bank robbery','battery','batt. on law enf. off.','bomb explosion','bomb threat','carjacking','child abuse','child neglect','commercial robbery','drunk driver','false imprisonment','hit and run','hold-up alarm','home invasion','kidnapping','murder','other sex crimes','person robbery','rape','strong arm robbery','threats/assaults','weapons/armed')
+nonviolent_list = c('bad check passed','bribery','burglary business','burglary hotel','burglary residence','commercial b&e','criminal mischief','drug violation','drunk pedestrian','drunk person','escaped prisoner','felony','felony drugs','forgery','fraud/counterfeit','fugitive from justice','gambling','grand theft','illegal fishing','impersonating police officer','misd. drugs','misdemeanor','petit theft','prostitution','residential b&e','resist w/o violence','shoplifting','theft','vandalism/criminal mischief')
+transport_list = c('abandoned boat','abandoned vehicle','accident','airplane accident','burglary vehicle','disabled occupied vehicle','illegally parked cars','obstruction on highway','obstruct on hwy','parking violation','reckless boat','reckless driver','reckless vehicle','signal out','stolen/lost tag','stolen/lost tag recovered','stolen vehicle','stolen vehicle recovered','suspicious boat','suspicious car/occupant armed','suspicious vehicle','traffic light','traffic (misc)','vehicle accident','vehicle alarm')
+oncall_list = c('911 emergency','911 hang up','animal calls','attempted suicide','bank alarm','check well being','commercial alarm','county ord. viol.','dead animal','dead person','deviant sexual activities','discharge weapon','domestic disturbance','door alarm','drowning','fire','fishing violation','found property','general disturbance','general investigation','hitchhiker','house/bus./area/check','house/business check','industrial accident','liquor law violation','lost/found property','mentally-ill person','missing person','missing person recovered','near drowning','noise ordinance violation','non-emergency assistance','non-so warrant','nuisance animal','obscene/harassing phone calls','open door/window','physical fight','prowler','rescue-medical only','residential alarm','security checkpoint alarm','sick or injured person','solicitor','stalking','suicide','suspicious hazard','suspicious incident','suspicious luggage','suspicious person','suspicious video','threatening animal','trash dumping','trespasser','unknown trouble','verbal disturbance')
+```
+
+```{r make reason_cat , echo=FALSE}
+opd$reason_cat <- 'other'
+opd$reason_cat <- ifelse(opd$reason %in% violent_list , 'violent' , opd$reason_cat)
+opd$reason_cat <- ifelse(opd$reason %in% nonviolent_list , 'nonviolent' , opd$reason_cat)
+opd$reason_cat <- ifelse(opd$reason %in% transport_list , 'transport' , opd$reason_cat)
+opd$reason_cat <- ifelse(opd$reason %in% oncall_list , 'oncall' , opd$reason_cat)
+opd$reason_cat <- factor(opd$reason_cat , levels = c('violent','nonviolent','transport','oncall','other'))
+```
+
+Now that we have our list, let's make a new column called 'reason_cat' that tells us which category that report belongs to and take a quick look at the distribution of our reason categories.
+
+```{r hist reason_cat , echo=FALSE , fig.width=8 , fig.height=6 , fig.align='center'}
+ggplot(data = opd , aes(x = reason_cat)) +
+  geom_bar(binwidth = 1 , fill = 'blue' , color = 'black') +
+  ggtitle('Histogram of Reason Categories')
+```
+
+Over half of the reports fall into the 'oncall' category, which makes sense. Police are often called upon to make official reports of an incident or act as a government liaison for certain events. That category also has the most individual reasons. I'd like to see the most frequent items in these categories.
+
+```{r summary violent , echo=FALSE}
+head(summary(subset(opd , reason_cat == 'violent')$reason) , 10)
+```
+
+Of our violent crimes, half of them are battery reports. In this category, 97% of our reports fall into the top 10 of the 27 reasons. Also, there are only 12 murder reports. This seems uncharacteristically low for a span of six years. It's possible that murder charges were added to other reports that are filed under a different primary reason.
+
+```{r summary nonviolent , echo=FALSE}
+head(summary(subset(opd , reason_cat == 'nonviolent')$reason) , 10)
+```
+
+Similarly, 97% of non-violent reports are also made up of the top 10 of 29.
+
+```{r summary transport , echo=FALSE}
+head(summary(subset(opd , reason_cat == 'transport')$reason) , 10)
+```
+
+Accidents make up half of our transport reports and are the second most common reason making up 8.3% of our dataset. Again, 97% of this category is made up of the top 10 of 25.
+
+```{r summary oncall , echo=FALSE}
+head(summary(subset(opd , reason_cat == 'oncall')$reason) , 10)
+```
+
+Now to our largest group. General disturbances are the most numerous reason making up 17.2% of this category and 9.4% of our dataset. We also have 'unknown' for 4.8% of our dataset. This category is a little more spread out with the top 10 making up only 78.6% of the 55 reasons.
+
+Armed with this new column, let's take another look at our hourly graph. This time, we'll divide each bar by category.
+
+```{r hist hour by reason_cat , echo=FALSE , fig.width=8 , fig.height=6 , fig.align='center'}
+ggplot(data = opd ,
+       aes(x = factor(hour) , fill = reason_cat , order = -as.numeric(reason_cat))) +
+  geom_bar(binwidth = 1 , color = 'black') +
+  scale_x_discrete(breaks = seq(0 , 24 , 2)) +
+  ggtitle('Reports by Hour with Categories')
+```
+
+For the most part, each category rises and falls with the overall arc of the day as we saw before. I have an idea that might explain what we see at 5 PM and 6 PM.
+
+The time associated with a police report is not when the incident actually happened; it's when the report is filed, ie when the officer arrives at that location. The heaviest rush hour traffic starts around 5 PM when most people leave work. I believe that many of the 6 PM reports happened in the 5 PM block, but the traffic kept enough officers from getting to the site promptly. If you average both bars in the graph, they fit the arc we would expect to see.
+
+Also, there are increases in the height of 'other' at 7 AM and 2 PM. Because of the timing and that 'other' mostly consists of non-incident police activities, I believe these increases are do to the public school system beginning and ending during those times.
+
+Let's see if that spike in August 2015 is related to the categories.
+
+```{r hist by reason_cat in 2015 , echo=FALSE , fig.width=8 , fig.height=6 , fig.align='center'}
+ggplot(data = subset(opd , year == 2015) ,
+       aes(x = factor(month) , fill = reason_cat , order = -as.numeric(reason_cat))) +
+  geom_bar(binwidth = 1 , color = 'black') +
+  ggtitle('Reports by Month in 2015 with Categories')
+```
+
+There it is. There was a dramatic increase in the 'oncall' category. However, there are also smaller increases in every other category as well. Given that our data for August is only 2/3 complete, there was definitely either an increase in overall police activity or a policy change that lead to more reports being filed.
+
+What about that increase in 2014?
+
+```{r hist by reason_cat in 2014 , echo=FALSE , fig.width=8 , fig.height=6 , fig.align='center'}
+ggplot(data = subset(opd , year == 2014) ,
+       aes(x = factor(month) , fill = reason_cat , order = -as.numeric(reason_cat))) +
+  geom_bar(binwidth = 1 , color = 'black') +
+  ggtitle('Reports by Month in 2014 with Categories')
+```
+
+These columns look very similar to the one in August 2015. It could be that they share the same cause. However, I believe there is something else going on here. The increase isn't strictly during the Summer; it starts in April and goes through November. Rather than either/or, I believe there was both a policy change and an increase in law enforcement presence. Why? The increase in reporting matches up to the election season. While the president wasn't on the ballot, the state governor was. However, we don't see a similar increase in 2012.
+
+##Day of the Week
+
+Because each row comes with a datetime string, we can use R to determine on which day of the week it was filed.
+
+```{r create dow , warning=FALSE , echo=FALSE}
+opd$dow <- weekdays(as.Date(opd$datetime , '%Y-%m-%d %H:%M:%S'))
+opd$dow <- factor(opd$dow , levels = c('Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'))
+```
+
+Let's take another look at those categories by day of the week.
+
+```{r hist dow by reason_cat , echo=FALSE , fig.width=8 , fig.height=6 , fig.align='center'}
+ggplot(data = opd , aes(x = dow , fill = reason_cat , order = -as.numeric(reason_cat))) +
+  geom_bar(binwidth = 1 , color = 'black') +
+  ggtitle('Reports by Day of the Week with Categories')
+```
+
+That's flatter than I thought it would be. There are slightly less reports on Sundays, but not by much. Maybe we'll see something if it's faceted (we'll exclude 'oncall' from this).
+
+```{r hist dow facet reason_cat , echo=FALSE , fig.width=8 , fig.height=6 , fig.align='center'}
+ggplot(data = opd , aes(x = dow)) +
+  geom_bar(binwidth = 1 , fill = 'blue' , color = 'black') +
+  facet_wrap(~reason_cat , ncol=3)
+```
+
+Violent crime stays steady throughout the week, while three of the five categories see drops over the weekend. This is likely to do with officer prioritization. A department only has so many officers to send places especially on weekends when some officers have a day off. Violent crimes take precedent, so they see relatively little fluctuation. The other categories are responded to based on the officers who are left. However, 'oncall' actually increased on Friday and Saturday. It's likely that some of the reasons in the category are not as time-dependent, so they are pushed to the weekend.
+
+Let's revisit that day boxplot, but we'll use points and color by day of the week this time.
+
+```{r jitter day dow , echo=FALSE , fig.width=8 , fig.height=6 , fig.align='center'}
+opd.day_num_dow <- opd %>%
+  group_by(dow , day , month , year) %>%
+  summarize(n = n())
+ggplot(data = opd.day_num_dow , aes(x = factor(day) , y = n , color = dow)) +
+  geom_jitter() +
+  ggtitle('Number of Reports per Day of the Month') +
+  facet_wrap(~year)
+rm(opd.day_num_dow)
+```
+
+There doesn't seem to be a connection between day of the week and the number of reports per day, but we can see why the bands of outliers exist in our boxplot. The number of reports are mostly consistent within each year except for 2014. When included with the other years, almost all of 2009 is considdered an outlier. In 2014, there are two distinct bands which likely has to do with the jumps in numbers from April to November. What I'm shocked to see is just how abrupt the changes are per year. For example, there are only a couple of days in 2010 that even fall into the range of 2009. This makes me think that a new police policy took effect at the very start of 2010 that had an immediate impact in the number of daily reports.
+
+##Heat Mapping
+
+Let's try to make some heat maps from our geo data. We know there are some outliers in the coordinates, so let's figure out a better bounding box. I know from an older project the approximate bounds of Orange County, FL. Let's start there with a decent buffer zone.
+
+```{r hist lat & lon , warning=FALSE , echo=FALSE , fig.width=8 , fig.height=6 , fig.align='center'}
+ggplot(data = opd , aes(x = lat)) +
+  geom_bar(binwidth = .01 , fill = 'blue' , color = 'black') +
+  scale_x_continuous(limits = c(28.26 , 28.84)) +
+  ggtitle('Histogram of Latitude Values')
+ggplot(data = opd , aes(x = lon)) +
+  geom_bar(binwidth = .01 , fill = 'blue' , color = 'black') +
+  scale_x_continuous(limits = c(-81.75 , -80.86)) +
+  ggtitle('Histogram of Longitude Values')
+```
+
+Now refining those values, we'll use (28.34,-81.6),(28.64,-81.2) as our bounding box. Let's create a subset of our data so we can round our coordinates. We'll also create a function that will turn the dataframe into a frequency table we can use in the visualizations. However, there's a caveat in the data. There's an unrealistic number of reports that are located at or in the immediate vicinity of the police station and the county courthouse. For the purpose of making these plots, we will also omit these two locations. We'll do this by supplying a frequency cap to our function.
+
+```{r create geo subset and heatmap func , echo=FALSE}
+opdgeo <- subset(opd ,
+                 lat >= 28.34 & lat <= 28.64 & lon >= -81.6 & lon <= -81.2 ,
+                 select = c('reason' , 'reason_cat' , 'lat' , 'lon'))
+#Create bins by rounding the coords to three decimal places
+opdgeo$lat <- round(opdgeo$lat , 3)
+opdgeo$lon <- round(opdgeo$lon , 3)
+
+create_heatmap_df <- function (df , omitFreq) {
+  #Create frequency table with only lat and lon columns
+  df.freq <- as.data.frame(table(df[,c('lat','lon')]))
+  #Convert lat and lon back to numerics
+  df.freq$lat <- as.numeric(as.character(df.freq$lat))
+  df.freq$lon <- as.numeric(as.character(df.freq$lon))
+  #Remove empty bins and bins greater than the threshold
+  df.freq <- subset(df.freq , Freq > 0 & Freq < omitFreq)
+  return(df.freq)
+}
+```
+
+Now for our visualization. We'll be using the ggmap package to overlay our frequency table on a map of Orlando (sourced from Google Maps).
+
+```{r heatmap all , warning=FALSE , message=FALSE , echo=FALSE , fig.width=9 , fig.height=7 , fig.align='center'}
+library(ggmap)
+orlando <- get_map(location = 'orlando', zoom = 12) #12
+ggmap(orlando) +
+  geom_tile(data = create_heatmap_df(opdgeo , 10000) ,
+            aes(x = lon , y = lat , alpha = Freq) , fill = 'red') +
+  theme(axis.title.y = element_blank(), axis.title.x = element_blank())
+```
+
+We can see that the darkest areas are downtown, along E & W Colonial Dr, and around shopping areas like the Millenia Mall. All of these areas are either highly populated or highly trafficked during the day. There's also a couple of hot spots around intersections which are likely due to accident reports.
+
+I'd like to break it down into just violent and non-violent reports.
+
+```{r heatmap violent , echo=FALSE , fig.width=9 , fig.height=7 , fig.align='center'}
+ggmap(orlando) +
+  geom_tile(data = create_heatmap_df(subset(opdgeo , reason_cat == 'violent') , 1000) ,
+            aes(x = lon , y = lat , alpha = Freq) , fill = 'red') +
+  theme(axis.title.y = element_blank(), axis.title.x = element_blank()) +
+  ggtitle('Heatmap of Violent Reports')
+```
+
+First, the locations with the greatest frequency of violent crime are:
+
+* Wall St (downtown bar/club scene)
+* The intersection of E Colonial and N Westmoreland Dr
+* Park/empty lot between Paramore and Callahan
+* Florida Hospital at Loch Haven
+* The neighborhood of Haralson Estates
+* Around the Heart of Mercy Church on Mercy Dr
+* Around the Apostolic Overcoming Church on Raleigh St
+
+These areas are centered around nightlife or are in low income neighborhoods. The outlier here is the Florida Hospital. I believe this is a similar situation to the police station where reports are filed at the hospital because the victim has already been rushed away from the scene for care.
+
+```{r heatmap nonviolent , echo=FALSE , fig.width=9 , fig.height=7 , fig.align='center'}
+ggmap(orlando) +
+  geom_tile(data = create_heatmap_df(subset(opdgeo , reason_cat == 'nonviolent') , 1000) ,
+            aes(x = lon , y = lat , alpha = Freq) , fill = 'red') +
+  theme(axis.title.y = element_blank(), axis.title.x = element_blank()) +
+  ggtitle('Heatmap of Non-Violent Reports')
+```
+
+Now, the locations with the greatest frequency of non-violent crime are:
+
+* Shopping Centers like Millenia Mall, West Oaks Mall, Florida Outlet Mall, Parkwood Plaza, and Wallmart south of Valencia
+* The intersection of E Colonial and N Westmoreland Dr
+* Park/empty lot between Paramore and Callahan
+* The Universal Studios employee parking lot
+
+With a few repeats, most of these areas are commercial shopping plazas. This makes sense because our non-violent crime category is dominated by types of theft including shoplifting. I do find it interesting that the Universal Studios employee parking lot was so red. It's likely that the guest parking lots have more incidents, but they're handled by park security.
+
+##Accidents
+
+I'd like to just look at our accident reports. I want to see what the least safe datetime is and the locations with the most accidents. Let's start with accidents by hour.
+
+```{r hist accidents by hour , echo=FALSE , fig.width=8 , fig.height=6 , fig.align='center'}
+ggplot(data = subset(opd , reason == 'accident') , aes(x = factor(hour))) +
+  geom_bar(binwidth = 1 , fill = 'blue' , color = 'black') +
+  ggtitle('Accident Reports by Hour')
+```
+
+We see that accidents also follow the 5 AM arc we saw earlier and have the 5 PM response time dip. We can also see that the number of accidents decreases just after morning rush hour.
+
+```{r hist accidents by dow , echo=FALSE , fig.width=8 , fig.height=6 , fig.align='center'}
+ggplot(data = subset(opd , reason == 'accident') , aes(x = dow)) +
+  geom_bar(binwidth = 1 , fill = 'blue' , color = 'black') +
+  ggtitle('Accident Reports by Day of the Week')
+```
+
+The number of accidents is only about 75% as high on the weekends. Most accidents happen on Friday. I bet this is because of people going out or traveling on Friday evening, and we'll see that with a faceted graph.
+
+```{r hist accidents by hour facet dow , echo=FALSE , fig.width=8 , fig.height=5 , fig.align='center'}
+ggplot(data = subset(opd , reason == 'accident') , aes(x = factor(hour))) +
+  geom_bar(binwidth = 1 , fill = 'blue' , color = 'black') +
+  facet_wrap(~dow , ncol = 4)
+```
+
+As I thought, we see an overall increase in accidents on Friday as people leave work. We get a second large spike in accidents at 4 PM as some people try to leave work early. As for the safest time, that would be at 4 AM on Thursday. We actually see the most early morning accidents reported on the weekend.
+
+Now let's see where the most accidents are.
+
+```{r heatmap accidents , echo=FALSE , fig.width=9 , fig.height=7 , fig.align='center'}
+opdgeo.accidents <- create_heatmap_df(subset(opdgeo , reason == 'accident') , 10000)
+ggmap(orlando) +
+  geom_tile(data = opdgeo.accidents ,
+            aes(x = lon , y = lat , alpha = Freq) , fill = 'red') +
+  theme(axis.title.y = element_blank(), axis.title.x = element_blank()) +
+  ggtitle('Heatmap of Accident Reports')
+head(opdgeo.accidents[order(opdgeo.accidents$Freq , decreasing = T) , ] , 11)
+rm(orlando)
+```
+
+Looking at the heatmap, we can see the coordinates match up to the darkest areas on the heatmap and they're all on top of road intersections.
+
+#Final Plots and Summary
+
+Over the course of this analysis, I believe these plots best represent the information and findings in the dataset.
+
+```{r final hist hour by reason_cat , echo=FALSE , fig.width=8 , fig.height=6 , fig.align='center'}
+ggplot(data = opd , aes(x = factor(hour) , fill = reason_cat , order = -as.numeric(reason_cat))) +
+  geom_bar(binwidth = 1 , color = 'black') +
+  scale_x_discrete(breaks = seq(0 , 24 , 2)) +
+  xlab('Hour of the Day (24-Hour)') + ylab('Number of Reports') +
+  labs(fill = 'Reason Category') +
+  ggtitle('Reports by Hour with Categories')
+```
+
+This first graph shows the number of reports divided by category through the course of the day. It generally shows how the level of police (and civilian) activity changes based on people's sleep habits, work schedule (and the resulting rush hours), and public school day. This graph also allowed me to figure out that "police in traffic" is likely the cause of the value changes we see at 5 PM and 6 PM.
+
+```{r final heatmap crime , message=FALSE , echo=FALSE , fig.width=9 , fig.height=7 , fig.align='center'}
+ggmap(get_map(location = 'orlando', zoom = 12 , color = 'bw')) +
+  geom_tile(data = create_heatmap_df(subset(opdgeo , reason_cat %in% c('violent' , 'nonviolent')) , 3000) ,
+            aes(x = lon , y = lat , fill = log10(Freq)) , alpha = .65) +
+  scale_fill_gradient(low = 'green' , high = 'red' ,
+                      labels = c('1','10','100','1000+')) +
+  xlab('Longitude') + ylab('Latitude') +
+  labs(fill = 'Crime Rate') +
+  ggtitle('Heatmap of Crime (Violent and Non-Violent) in Orlando 4/09-8/15')
+```
+
+This heatmap shows the geo-spacial distribution of crime reports in the city. This is the kind of plot that best tells where additional patrols would best be utilized. There are hotspots of crime around the suspected places like downtown, shopping centers, and some low-income neighborhoods. However, there are other places of concern.
+
+* Rosemont Elementary School lies between the two Northern-most hotspots
+* Rocklake Elementary School is less than 1km to the first and fifth worst hotspots
+* Two of the hotspots are centered around churches: Heart of Mercy and Apostolic Overcoming
+* Valencia West Campus due to the adjacent Wallmart
+
+```{r final hist accidents by hour facet dow , echo=FALSE , fig.width=8 , fig.height=5 , fig.align='center'}
+ggplot(data = subset(opd , reason == 'accident') , aes(x = factor(hour))) +
+  geom_bar(binwidth = 1 , fill = 'blue' , color = 'black') +
+  scale_x_discrete(breaks = seq(0 , 24 , 4)) +
+  facet_wrap(~dow , ncol = 4) +
+  xlab('Hour of the Day (24-Hour)') + ylab('Number of Reports') +
+  ggtitle('Accident Reports by Hour by Day of the Week')
+```
+
+This faceted graph can best inform people when the safest time to drive is. On Fridays, for example, it might be safer to wait an extra hour at work than try to leave an hour early.
+
+Using the same subset as the graph above, here are the most dangerous intersections in Orlando ranked by the number of accident reports from April 2009 to August 2015:
+
+* 2650: Conroy Rd & S Kirkman Rd
+* 1016: Conroy Rd & Vineland Rd
+* &nbsp;&nbsp;978: Vineland Rd & S Kirkman Rd
+* &nbsp;&nbsp;967: E Michigan St & S Orange Ave
+* &nbsp;&nbsp;913: Hoffner Ave & S Semoran Blvd
+* &nbsp;&nbsp;907: Curry Ford Rd & S Semoran Blvd
+* &nbsp;&nbsp;878: Gatlin/Pershing Ave & S Semoran Blvd
+* &nbsp;&nbsp;827: International Dr & S Kirkman Rd
+* &nbsp;&nbsp;811: Metrowest Blvd & S Kirkman
+* &nbsp;&nbsp;806: Conroy Rd & Millenia Blvd
+
+#Reflection
+
+##Issues
+
+As far as usable data goes, this dataset started as report items with a datetime string, a reason string, and lat/lon coordinates. In other words, mostly categorical data. Attempting to use the data "as is" was not going to lead to any useful conclusions. I had to figure out ways to augment this database using the data available. Some of the new columns were created programmatically, like splitting the datetime, while some required a more "hands on" approach, like categorizing the report reasons individually.
+
+By far, I had the most trouble figuring out how to create the heatmaps. I started looking at ggplot2 with geom_map, but the smallest I could get was a blank polygon map of Florida's counties. Then I looked at RgoogleMaps, but decided it wasn't what I wanted. I tried (successfully) creating a heatmap by exporting the dataframe to Google Fusion Tables, but they don't offer the color gradient overlay. It only put a solid dot at the geo-location of each, which didn't adequately convey the data behind 1.45 million reports.
+
+Finally I found a library called ggmap which I could use with the ggplot additive layers. Specifically, using geom_tile with variable alpha levels, I was able to subset and round a dataframe to color the heatmap by location. The nice thing about ggmap is that it automatically restricts the bounds of the data displayed based on the bounds of the map. This meant I could change the zoom level without having to recreate the initial opdgeo dataframe.
+
+##Insights
+
+I originally divided the datetime column into sections in Python but didn't re-include it. I decided to rerun the script to add it back in after I realized that I wanted to use R to determine the day of the week, which required a POSIX-style datetime string, not the values themselves.
+
+The most interesting part was redrawing some of the graphs after creating the reason categories. Seeing a jump of 'oncall' reports between 5 PM and 6 PM is what made me realize "the cops get stuck in traffic too" could be a valid explanation for the difference in the original plot.
+
+##Improvements
+
+One thing this analysis lacks is any sort of modeling. It could be possible to merge coordinate-based demographic data to model the number of reports for an area over a given period of time.
+
+##Conclusions
+
+A look into the report dataset shows that the Orlando police spend comparatively little time responding to actual crimes and making arrests. At least half of their time is spent either as a third-party for reporting an event or as a figure of authority to de-escalate a tense, non-criminal situation. While supposedly limited to Orlando, they often assist county and local police in smaller towns outside of the city's official, twisted limits.
+
+#References
+
+<http://stackoverflow.com/questions/5234117/how-to-drop-columns-by-name-in-a-data-frame>
+
+<http://stackoverflow.com/questions/11985799/converting-date-to-a-day-of-week-in-r>
+
+<http://www.bjs.gov/index.cfm?ty=tp&tid=31>
+
+<https://learnr.wordpress.com/2010/03/23/ggplot2-changing-the-default-order-of-legend-labels-and-stacking-of-data/>
+
+<http://rstudio-pubs-static.s3.amazonaws.com/7433_4537ea5073dc4162950abb715f513469.html>
+
+<http://www.r-bloggers.com/visualising-thefts-using-heatmaps-in-ggplot2/>
+
+<https://gist.github.com/jmarhee/8530768>
+
+<http://stats.stackexchange.com/questions/5007/how-can-i-change-the-title-of-a-legend-in-ggplot2>
